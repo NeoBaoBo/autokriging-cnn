@@ -1,0 +1,18 @@
+# Training artifacts
+trained_models/
+training_logs/
+synthetic_data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Model checkpoints
+*.pth
+*.pt
+
+# IDE
+.vscode/
+.idea/
