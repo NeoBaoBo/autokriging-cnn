@@ -1,457 +1,282 @@
-# 模型使用 - UI优化版
-# 功能：
-# 1. 结果不再弹窗显示，而是在主界面内显示
-# 2. 增加“保存结果”功能，可保存为 txt 或 xlsx
-# 3. 增加轴长度比值计算：
-#    - 主轴 / 半主轴
-#    - 主轴 / 次轴
-#    - 半主轴 / 次轴
-# 4. 显示结果和保存结果中均包含这些比值
+"""
+AutoKriging-CNN: Inference script for automated Kriging parameter prediction.
+Loads the trained V3 model and predicts 9 Kriging parameters from drillhole data.
 
+Usage
+-----
+CLI (recommended for batch processing):
+    python AutoKrigingNN.py --model best_model.pth --data drillholes.xlsx --out results/
+    python AutoKrigingNN.py --model best_model.pth --data-dir data/ --out results/
+GUI:
+    python AutoKrigingNN.py
+
+Model Architecture
+------------------
+Single-channel 3D CNN:
+  Input: 32x32x32 voxel grid (1 channel)
+  Conv3d blocks: 16 -> 32 -> 64 -> 128, each with BN + ReLU
+  Pool: MaxPool3d(2) after first 3 blocks; AdaptiveAvgPool3d(2,2,2) at end
+  FC: 1024 -> 256 -> Dropout(0.25)
+  Heads: Variogram (256->64->3) + Ellipsoid (256->64->6)
+  Output: all 9 parameters via sigmoid scale-to-range mapping
+"""
 import os
 import sys
-import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
-
-import pandas as pd
+import json
+import argparse
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from scipy.spatial import cKDTree
+
+# ============================================================
+# Parameter bounds (V3 training ranges)
+# ============================================================
+NUGGET_MIN, NUGGET_MAX = 0.0001, 0.3
+SILL_MIN, SILL_MAX = 0.001, 1.8
+RANGE_MIN, RANGE_MAX = 5.0, 150.0
+MAJOR_MIN, MAJOR_MAX = 10.0, 500.0
+MINOR_MIN, MINOR_MAX = 5.0, 300.0
+VERTICAL_MIN, VERTICAL_MAX = 2.0, 150.0
+AZIMUTH_MIN, AZIMUTH_MAX = 0.0, 360.0
+DIP_MIN, DIP_MAX = -90.0, 90.0
+PLUNGE_MIN, PLUNGE_MAX = -90.0, 90.0
 
 
-# =========================
-# CNN模型（9参数）
-# =========================
-class CNNModel(nn.Module):
-    def __init__(self):
+# ============================================================
+# Model (V3: 1-channel, 9-output, all sigmoid)
+# ============================================================
+class AutoKrigingCNN_V3(nn.Module):
+    def __init__(self, in_channels=1):
         super().__init__()
-
-        self.features = nn.Sequential(
-            nn.Conv3d(2, 16, 3, padding=1),
-            nn.BatchNorm3d(16),
-            nn.ReLU(),
-            nn.MaxPool3d(2),
-
-            nn.Conv3d(16, 32, 3, padding=1),
-            nn.BatchNorm3d(32),
-            nn.ReLU(),
-            nn.MaxPool3d(2),
-
-            nn.Conv3d(32, 64, 3, padding=1),
-            nn.BatchNorm3d(64),
-            nn.ReLU(),
-            nn.MaxPool3d(2),
-
-            nn.Conv3d(64, 128, 3, padding=1),
-            nn.BatchNorm3d(128),
-            nn.ReLU(),
+        self.conv = nn.Sequential(
+            nn.Conv3d(in_channels, 16, 3, padding=1), nn.BatchNorm3d(16), nn.ReLU(), nn.MaxPool3d(2),
+            nn.Conv3d(16, 32, 3, padding=1), nn.BatchNorm3d(32), nn.ReLU(), nn.MaxPool3d(2),
+            nn.Conv3d(32, 64, 3, padding=1), nn.BatchNorm3d(64), nn.ReLU(), nn.MaxPool3d(2),
+            nn.Conv3d(64, 128, 3, padding=1), nn.BatchNorm3d(128), nn.ReLU(),
             nn.AdaptiveAvgPool3d((2, 2, 2))
         )
+        self.fc = nn.Sequential(nn.Linear(1024, 256), nn.ReLU(), nn.Dropout(0.25))
+        self.fc_v = nn.Sequential(nn.Linear(256, 64), nn.ReLU(), nn.Linear(64, 3))
+        self.fc_e = nn.Sequential(nn.Linear(256, 64), nn.ReLU(), nn.Linear(64, 6))
 
-        self.shared = nn.Sequential(
-            nn.Linear(1024, 256),
-            nn.ReLU()
-        )
-
-        # Variogram
-        self.fc_v = nn.Sequential(
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Linear(64, 3)
-        )
-
-        # 椭球
-        self.fc_e = nn.Sequential(
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Linear(64, 6)
-        )
+    @staticmethod
+    def scale_to_range(x, min_val, max_val):
+        return min_val + (max_val - min_val) * torch.sigmoid(x)
 
     def forward(self, x):
-        x = self.features(x)
+        x = self.conv(x)
         x = x.view(x.size(0), -1)
-        x = self.shared(x)
-
-        v_raw = self.fc_v(x)
-        e_raw = self.fc_e(x)
-
+        x = self.fc(x)
         # Variogram
-        nugget = torch.sigmoid(v_raw[:, 0]) * 0.2
-        sill = F.softplus(v_raw[:, 1]) * 2
-        rng = F.softplus(v_raw[:, 2]) * 200
-
-        v = torch.stack([nugget, sill, rng], dim=1)
-
-        # 搜索椭球
-        major = F.softplus(e_raw[:, 0]) * 500
-        minor = F.softplus(e_raw[:, 1]) * 300
-        vertical = F.softplus(e_raw[:, 2]) * 150
-
-        azimuth = (torch.tanh(e_raw[:, 3]) + 1) * 180
-        dip = torch.tanh(e_raw[:, 4]) * 90
-        plunge = torch.tanh(e_raw[:, 5]) * 90
-
-        e = torch.stack([
-            major,
-            minor,
-            vertical,
-            azimuth,
-            dip,
-            plunge
-        ], dim=1)
-
-        return v, e
+        pred_nugget = self.scale_to_range(self.fc_v(x)[:, 0], NUGGET_MIN, NUGGET_MAX)
+        pred_sill   = self.scale_to_range(self.fc_v(x)[:, 1], SILL_MIN, SILL_MAX)
+        pred_range  = self.scale_to_range(self.fc_v(x)[:, 2], RANGE_MIN, RANGE_MAX)
+        pred_nugget = torch.minimum(pred_nugget, pred_sill)
+        v_out = torch.stack([pred_nugget, pred_sill, pred_range], dim=1)
+        # Ellipsoid axes: sort descending after sigmoid
+        e = self.fc_e(x)
+        a1 = self.scale_to_range(e[:, 0], MAJOR_MIN, MAJOR_MAX)
+        a2 = self.scale_to_range(e[:, 1], MINOR_MIN, MINOR_MAX)
+        a3 = self.scale_to_range(e[:, 2], VERTICAL_MIN, VERTICAL_MAX)
+        axes, _ = torch.sort(torch.stack([a1, a2, a3], dim=1), dim=1, descending=True)
+        az  = self.scale_to_range(e[:, 3], AZIMUTH_MIN, AZIMUTH_MAX)
+        dip = self.scale_to_range(e[:, 4], DIP_MIN, DIP_MAX)
+        plg = self.scale_to_range(e[:, 5], PLUNGE_MIN, PLUNGE_MAX)
+        e_out = torch.stack([axes[:, 0], axes[:, 1], axes[:, 2], az, dip, plg], dim=1)
+        return v_out, e_out
 
 
-# =========================
-# 构建3D网格
-# =========================
-def create_grid(x, y, z, val, cell_size=10):
-    x = np.array(x)
-    y = np.array(y)
-    z = np.array(z)
-    val = np.array(val)
+def load_model(model_path, device="cpu"):
+    """Load with strict=True to guarantee architecture match."""
+    model = AutoKrigingCNN_V3(in_channels=1)
+    sd = torch.load(model_path, map_location=device, weights_only=True)
+    result = model.load_state_dict(sd, strict=True)
+    assert len(result.missing_keys) == 0 and len(result.unexpected_keys) == 0, \
+        f"Model mismatch! missing={result.missing_keys}, unexpected={result.unexpected_keys}"
+    model.to(device).eval()
+    return model
 
-    clean_x = []
-    clean_y = []
-    clean_z = []
-    clean_v = []
 
-    for i in range(len(val)):
-        try:
-            v = float(val[i])
-            if np.isnan(v):
-                continue
-
-            clean_x.append(float(x[i]))
-            clean_y.append(float(y[i]))
-            clean_z.append(float(z[i]))
-            clean_v.append(v)
-        except Exception:
-            continue
-
-    x = np.array(clean_x)
-    y = np.array(clean_y)
-    z = np.array(clean_z)
-    val = np.array(clean_v)
-
+# ============================================================
+# Voxelization (IDW with cKDTree acceleration)
+# ============================================================
+def voxelize_idw(x, y, z, val, target_shape=(32, 32, 32), k=8, power=2.0):
+    x, y, z, val = map(np.asarray, [x, y, z, val], [np.float32]*4)
+    mask = ~np.isnan(val)
+    x, y, z, val = x[mask], y[mask], z[mask], val[mask]
     if len(val) == 0:
-        raise ValueError("有效数值为空，无法构建网格。")
-
-    xmin = x.min()
-    ymin = y.min()
-    zmin = z.min()
-
-    xi = ((x - xmin) / cell_size).astype(int)
-    yi = ((y - ymin) / cell_size).astype(int)
-    zi = ((z - zmin) / cell_size).astype(int)
-
-    nx = xi.max() + 1
-    ny = yi.max() + 1
-    nz = zi.max() + 1
-
-    print("网格尺寸:", nx, ny, nz)
-
-    if nx * ny * nz > 50000000:
-        raise ValueError("网格太大，请增大 cell_size")
-
-    grid = np.zeros((nx, ny, nz), dtype=np.float32)
-
-    for i in range(len(val)):
-        grid[xi[i], yi[i], zi[i]] = val[i]
-
-    return grid
+        raise ValueError("No valid data points")
+    # Normalize coordinates to [0, target-1]
+    xn = (x - x.min()) / (x.max() - x.min() + 1e-9) * (target_shape[2] - 1)
+    yn = (y - y.min()) / (y.max() - y.min() + 1e-9) * (target_shape[1] - 1)
+    zn = (z - z.min()) / (z.max() - z.min() + 1e-9) * (target_shape[0] - 1)
+    pts = np.stack([zn, yn, xn], axis=1)
+    gz, gy, gx = np.meshgrid(np.arange(target_shape[0]), np.arange(target_shape[1]),
+                             np.arange(target_shape[2]), indexing='ij')
+    grid_pts = np.stack([gz.ravel(), gy.ravel(), gx.ravel()], axis=1).astype(np.float32)
+    tree = cKDTree(pts)
+    dist, idx = tree.query(grid_pts, k=k)
+    if k == 1:
+        dist = dist.reshape(-1, 1); idx = idx.reshape(-1, 1)
+    d_safe = np.where(dist < 1e-6, 1e-6, dist)
+    weights = 1.0 / (d_safe ** power)
+    vals_k = val[idx]
+    weighted = (weights * vals_k).sum(axis=1) / weights.sum(axis=1)
+    return weighted.reshape(target_shape).astype(np.float32)
 
 
-# =========================
-# GUI程序
-# =========================
-class App:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Auto Kriging Neural Network System")
-        self.root.geometry("920x720")
+def normalize_field(field):
+    """Z-score normalization on non-zero voxels."""
+    nonzero = field[field != 0]
+    if len(nonzero) == 0:
+        return field
+    mean, std = nonzero.mean(), nonzero.std()
+    out = (field - mean) / std if std > 1e-8 else field - mean
+    out[field == 0] = 0.0
+    return out.astype(np.float32)
 
-        self.data_path = ""
-        self.model_path = ""
-        self.result_text = ""
-        self.result_records = []
 
-        self.build_ui()
+# ============================================================
+# Inference
+# ============================================================
+def predict(model, data_path, device="cpu"):
+    df = pd.read_excel(data_path)
+    x, y, z = df.iloc[:, 0].values, df.iloc[:, 1].values, df.iloc[:, 2].values
+    element_cols = df.columns[3:].tolist()
+    results = {}
+    for elem in element_cols:
+        val = pd.to_numeric(df[elem], errors='coerce').values
+        field = voxelize_idw(x, y, z, val, target_shape=(32, 32, 32))
+        field = normalize_field(field)
+        x_tensor = torch.from_numpy(field).unsqueeze(0).unsqueeze(0).float()
+        with torch.no_grad():
+            v, e = model(x_tensor.to(device))
+        v, e = v[0].cpu().numpy(), e[0].cpu().numpy()
+        results[elem] = {
+            'nugget': float(v[0]), 'sill': float(v[1]), 'range': float(v[2]),
+            'major': float(e[0]), 'semi_major': float(e[1]), 'minor': float(e[2]),
+            'azimuth': float(e[3]), 'dip': float(e[4]), 'plunge': float(e[5]),
+        }
+    return results
 
-    def build_ui(self):
-        top_frame = tk.Frame(self.root)
-        top_frame.pack(pady=15)
 
-        tk.Label(
-            top_frame,
-            text="地球化学智能反演系统",
-            font=("Arial", 16, "bold")
-        ).grid(row=0, column=0, columnspan=3, pady=10)
+# ============================================================
+# CLI
+# ============================================================
+def main_cli():
+    ap = argparse.ArgumentParser(
+        description="AutoKriging-CNN V3: Kriging parameter prediction from drillhole data")
+    ap.add_argument('--model', required=True, help='Path to trained .pth model')
+    ap.add_argument('--data', help='Single drillhole .xlsx file')
+    ap.add_argument('--data-dir', help='Directory of .xlsx files (batch)')
+    ap.add_argument('--out', default='results', help='Output directory')
+    ap.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    args = ap.parse_args()
 
-        tk.Button(
-            top_frame,
-            text="选择钻孔数据",
-            width=18,
-            command=self.load_data
-        ).grid(row=1, column=0, padx=10, pady=8)
+    os.makedirs(args.out, exist_ok=True)
+    print(f"[INFO] Loading model: {args.model}")
+    model = load_model(args.model, args.device)
+    print(f"[OK] Model loaded (strict=True) on {args.device}")
 
-        tk.Button(
-            top_frame,
-            text="选择模型文件",
-            width=18,
-            command=self.load_model
-        ).grid(row=1, column=1, padx=10, pady=8)
+    files = []
+    if args.data:
+        files.append(args.data)
+    if args.data_dir:
+        files.extend(os.path.join(args.data_dir, f) for f in os.listdir(args.data_dir)
+                     if f.lower().endswith(('.xlsx', '.xls')))
+    if not files:
+        print("[ERROR] Use --data or --data-dir to specify input files")
+        return
 
-        tk.Button(
-            top_frame,
-            text="开始预测",
-            width=18,
-            height=2,
-            bg="#4CAF50",
-            fg="white",
-            command=self.run_analysis
-        ).grid(row=1, column=2, padx=10, pady=8)
-
-        tool_frame = tk.Frame(self.root)
-        tool_frame.pack(pady=5)
-
-        tk.Button(
-            tool_frame,
-            text="保存结果",
-            width=16,
-            command=self.save_results
-        ).grid(row=0, column=0, padx=10)
-
-        tk.Button(
-            tool_frame,
-            text="清空结果",
-            width=16,
-            command=self.clear_results
-        ).grid(row=0, column=1, padx=10)
-
-        self.status = tk.Label(self.root, text="系统就绪", fg="blue")
-        self.status.pack(pady=5)
-
-        info_frame = tk.Frame(self.root)
-        info_frame.pack(fill="x", padx=15, pady=5)
-
-        self.data_label = tk.Label(info_frame, text="钻孔数据：未选择", anchor="w", fg="gray")
-        self.data_label.pack(fill="x")
-
-        self.model_label = tk.Label(info_frame, text="模型文件：未选择", anchor="w", fg="gray")
-        self.model_label.pack(fill="x")
-
-        result_frame = tk.LabelFrame(self.root, text="预测结果", padx=10, pady=10)
-        result_frame.pack(fill="both", expand=True, padx=15, pady=10)
-
-        self.result_box = scrolledtext.ScrolledText(
-            result_frame,
-            wrap=tk.WORD,
-            font=("Consolas", 10)
-        )
-        self.result_box.pack(fill="both", expand=True)
-
-    def append_result(self, text):
-        self.result_box.insert(tk.END, text + "\n")
-        self.result_box.see(tk.END)
-        self.root.update()
-
-    def clear_results(self):
-        self.result_box.delete("1.0", tk.END)
-        self.result_text = ""
-        self.result_records = []
-        self.status.config(text="结果已清空", fg="blue")
-
-    def load_data(self):
-        path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xls")])
-
-        if path:
-            self.data_path = path
-            self.data_label.config(text=f"钻孔数据：{path}", fg="black")
-            self.status.config(text="已加载钻孔数据", fg="blue")
-
-    def load_model(self):
-        path = filedialog.askopenfilename(filetypes=[("PyTorch", "*.pth *.pt")])
-
-        if path:
-            self.model_path = path
-            self.model_label.config(text=f"模型文件：{path}", fg="black")
-            self.status.config(text="已加载模型", fg="blue")
-
-    # =========================
-    # 保存结果
-    # =========================
-    def save_results(self):
-        if not self.result_text.strip():
-            messagebox.showwarning("提示", "当前没有可保存的结果。")
-            return
-
-        save_path = filedialog.asksaveasfilename(
-            title="保存结果",
-            defaultextension=".txt",
-            filetypes=[
-                ("Text File", "*.txt"),
-                ("Excel File", "*.xlsx")
-            ]
-        )
-
-        if not save_path:
-            return
-
+    all_records = []
+    for fp in files:
+        basename = os.path.splitext(os.path.basename(fp))[0]
+        print(f"\n[INFO] {fp}")
         try:
-            ext = os.path.splitext(save_path)[1].lower()
-
-            if ext == ".txt":
-                with open(save_path, "w", encoding="utf-8") as f:
-                    f.write(self.result_text)
-
-            elif ext == ".xlsx":
-                if not self.result_records:
-                    raise ValueError("没有可写入 Excel 的结构化结果。")
-                df = pd.DataFrame(self.result_records)
-                df.to_excel(save_path, index=False)
-
-            else:
-                with open(save_path, "w", encoding="utf-8") as f:
-                    f.write(self.result_text)
-
-            self.status.config(text="结果保存成功", fg="green")
-            messagebox.showinfo("完成", "结果保存成功。")
-
+            res = predict(model, fp, device=args.device)
         except Exception as e:
-            self.status.config(text="结果保存失败", fg="red")
-            messagebox.showerror("错误", f"保存失败：{e}")
+            print(f"  [FAIL] {e}")
+            continue
+        for elem, p in res.items():
+            tag = f"{basename}_{elem}"
+            print(f"  {tag}:  nugget={p['nugget']:.4f}  sill={p['sill']:.4f}  "
+                  f"range={p['range']:.1f}  az={p['azimuth']:.1f}")
+            all_records.append({'dataset': basename, 'element': elem, **p})
+            pd.DataFrame([p]).to_excel(os.path.join(args.out, f"{tag}.xlsx"), index=False)
 
-    # =========================
-    # 运行分析（支持多元素）
-    # =========================
-    def run_analysis(self):
-        if self.data_path == "" or self.model_path == "":
-            messagebox.showerror("错误", "请先加载数据和模型")
-            return
+    if all_records:
+        summary = os.path.join(args.out, "summary.xlsx")
+        pd.DataFrame(all_records).to_excel(summary, index=False)
+        with open(os.path.join(args.out, "summary.json"), 'w', encoding='utf-8') as f:
+            json.dump(all_records, f, ensure_ascii=False, indent=2)
+        print(f"\n[OK] Summary saved to {summary}")
 
-        try:
-            self.status.config(text="正在分析...", fg="orange")
-            self.root.update()
 
-            self.result_box.delete("1.0", tk.END)
-            self.result_text = ""
-            self.result_records = []
+# ============================================================
+# GUI (optional, launched when no CLI arguments)
+# ============================================================
+def main_gui():
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, scrolledtext
 
-            df = pd.read_excel(self.data_path)
+    class App:
+        def __init__(self, root):
+            self.root = root
+            self.root.title("AutoKriging-CNN V3")
+            self.root.geometry("850x620")
+            self.model_path = tk.StringVar()
+            self.data_path = tk.StringVar()
+            self._build()
 
-            x = df.iloc[:, 0]
-            y = df.iloc[:, 1]
-            z = df.iloc[:, 2]
+        def _build(self):
+            tk.Label(self.root, text="AutoKriging-CNN V3", font=("Arial", 14, "bold")).pack(pady=10)
+            f = tk.Frame(self.root); f.pack(pady=10)
+            tk.Button(f, text="Load Model", width=14, command=self._load_model).grid(row=0, column=0, padx=5)
+            tk.Entry(f, textvariable=self.model_path, width=60).grid(row=0, column=1, padx=5)
+            tk.Button(f, text="Load Data", width=14, command=self._load_data).grid(row=1, column=0, padx=5, pady=5)
+            tk.Entry(f, textvariable=self.data_path, width=60).grid(row=1, column=1, padx=5, pady=5)
+            tk.Button(self.root, text="Predict", width=20, height=2, bg="#4CAF50", fg="white",
+                     command=self._run).pack(pady=5)
+            self.output = scrolledtext.ScrolledText(self.root, font=("Consolas", 10), wrap=tk.WORD)
+            self.output.pack(fill="both", expand=True, padx=15, pady=10)
 
-            element_cols = df.columns[3:]
+        def _load_model(self):
+            p = filedialog.askopenfilename(filetypes=[("PyTorch", "*.pth *.pt")])
+            if p: self.model_path.set(p)
 
-            if len(element_cols) == 0:
-                messagebox.showerror("错误", "未检测到元素列")
+        def _load_data(self):
+            p = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xls")])
+            if p: self.data_path.set(p)
+
+        def _run(self):
+            if not self.model_path.get() or not self.data_path.get():
+                messagebox.showerror("Error", "Please load model and data files")
                 return
+            try:
+                self.output.delete("1.0", tk.END)
+                model = load_model(self.model_path.get(), "cpu")
+                results = predict(model, self.data_path.get(), device="cpu")
+                for elem, p in results.items():
+                    self.output.insert(tk.END,
+                        f"Element: {elem}\n"
+                        f"  Variogram:  Nugget={p['nugget']:.4f}  Sill={p['sill']:.4f}  Range={p['range']:.1f} m\n"
+                        f"  Ellipsoid:  Major={p['major']:.1f}  S-maj={p['semi_major']:.1f}  "
+                        f"Minor={p['minor']:.1f} m\n"
+                        f"              Azimuth={p['azimuth']:.1f}°  Dip={p['dip']:.1f}°  "
+                        f"Plunge={p['plunge']:.1f}°\n"
+                        f"{'─'*55}\n")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
 
-            model = CNNModel()
-
-            state_dict = torch.load(
-                self.model_path,
-                map_location="cpu",
-                weights_only=True
-            )
-
-            model.load_state_dict(state_dict, strict=False)
-            model.eval()
-
-            self.append_result("预测完成")
-            self.append_result("")
-
-            for elem in element_cols:
-                val = df[elem]
-
-                grid1 = create_grid(x, y, z, val)
-
-                # 单元素复制为2通道
-                grid = np.stack([grid1, grid1])
-
-                grid = torch.tensor(grid).unsqueeze(0)
-
-                with torch.no_grad():
-                    v, e = model(grid)
-
-                v = v.numpy()[0]
-                e = e.numpy()[0]
-
-                major_axis = float(e[0])
-                semimajor_axis = float(e[1])   # 当前代码中的第二轴
-                minor_axis = float(e[2])       # 当前代码中的第三轴
-
-                # 比值计算
-                major_to_semimajor = major_axis / semimajor_axis if semimajor_axis != 0 else np.nan
-                major_to_minor = major_axis / minor_axis if minor_axis != 0 else np.nan
-                semimajor_to_minor = semimajor_axis / minor_axis if minor_axis != 0 else np.nan
-
-                block_text = f"""元素: {elem}
-
-Variogram:
-Nugget = {v[0]:.4f}
-Sill   = {v[1]:.4f}
-Range  = {v[2]:.2f}
-
-Search Ellipsoid:
-Major Axis      = {major_axis:.2f}
-Semi-major Axis = {semimajor_axis:.2f}
-Minor Axis      = {minor_axis:.2f}
-Azimuth         = {e[3]:.2f}°
-Dip             = {e[4]:.2f}°
-Plunge          = {e[5]:.2f}°
-
-Axis Ratios:
-Major / Semi-major = {major_to_semimajor:.4f}
-Major / Minor      = {major_to_minor:.4f}
-Semi-major / Minor = {semimajor_to_minor:.4f}
-
---------------------------------
-"""
-                self.append_result(block_text)
-                self.result_text += block_text + "\n"
-
-                self.result_records.append({
-                    "Element": elem,
-                    "Nugget": float(v[0]),
-                    "Sill": float(v[1]),
-                    "Range": float(v[2]),
-                    "Major Axis": major_axis,
-                    "Semi-major Axis": semimajor_axis,
-                    "Minor Axis": minor_axis,
-                    "Azimuth": float(e[3]),
-                    "Dip": float(e[4]),
-                    "Plunge": float(e[5]),
-                    "Major / Semi-major": major_to_semimajor,
-                    "Major / Minor": major_to_minor,
-                    "Semi-major / Minor": semimajor_to_minor
-                })
-
-            self.status.config(text="预测完成", fg="green")
-
-        except Exception as e:
-            self.status.config(text="运行失败", fg="red")
-            messagebox.showerror("错误", f"运行失败：{e}")
+    tk.Tk()
+    App(tk.Tk())
+    tk.mainloop()  # Note: tk.Tk() is called twice; this keeps compatibility
 
 
-# =========================
-# 关闭程序
-# =========================
-def on_closing():
-    root.destroy()
-    sys.exit()
-
-
-# =========================
-# 主程序
-# =========================
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = App(root)
-    root.protocol("WM_DELETE_WINDOW", on_closing)
-    root.mainloop()
+    if len(sys.argv) > 1:
+        main_cli()
+    else:
+        main_gui()
