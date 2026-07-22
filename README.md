@@ -72,9 +72,21 @@ python AutoKrigingNN.py
 The trained model weights (`best_model_20260331-2.pth`) are available at:
 <https://github.com/NeoBaoBo/autokriging-cnn/releases>
 
+## Documentation
+
+Detailed documentation is available in the [docs/](docs/) directory:
+
+| Document | Description |
+|----------|-------------|
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Architecture design and technical decisions |
+| [API_REFERENCE.md](docs/API_REFERENCE.md) | API documentation for all core modules |
+| [DEVELOPMENT.md](docs/DEVELOPMENT.md) | Development guide, testing, and contributing |
+| [FAQ.md](docs/FAQ.md) | Frequently asked questions and troubleshooting |
+| [CHANGELOG.md](docs/CHANGELOG.md) | Version history and changes |
+
 ## Reference
 
-Wang, Y.P. and Wang, Y.S. Automated End-to-End Prediction of Kriging Parameters Using Three-Dimensional Convolutional Neural Networks. *Computers & Geosciences*, under review.
+Wang, Y.P., Zhang, H.T., and Wang, Y.S. Automated End-to-End Prediction of Kriging Parameters Using Three-Dimensional Convolutional Neural Networks. *Computers & Geosciences*, under review.
 
 ## License
 
