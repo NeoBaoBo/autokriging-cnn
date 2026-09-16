@@ -1,25 +1,23 @@
 # AutoKriging-CNN
 
-Automated end-to-end Kriging parameter prediction using three-dimensional convolutional neural networks.
+Automated prediction of the variogram range for Kriging using a three-dimensional convolutional neural network.
 
 ## Overview
 
-AutoKriging-CNN predicts nine Kriging parameters — three variogram parameters (nugget, sill, range) and six search ellipsoid parameters (major, semi-major, and minor axis lengths, plus azimuth, dip, and plunge angles) — directly from voxelized drillhole data through a single-channel 3D convolutional neural network.
-
-**Model architecture (V3):** 4 Conv3D blocks (16→32→64→128) with BatchNorm + ReLU, followed by MaxPool3d(2) after the first three blocks and AdaptiveAvgPool3d(2,2,2) at the end. A shared FC layer (1024→256, Dropout 0.25) feeds two task-specific heads (256→64→3 for variogram, 256→64→6 for ellipsoid). All nine parameters use sigmoid-based scale-to-range output mapping.
+AutoKriging-CNN predicts the **variogram range along 64 directions** directly from voxelized drillhole data. The three axis lengths and principal orientations of the search ellipsoid are then recovered from these directional ranges by positive-definite tensor fitting, and the sill and nugget are computed analytically (the sill as the sample variance and the nugget as the experimental variogram intercept). This design lets the network concentrate on the second-order spatial structure (the range), which is the quantity that actually requires variogram fitting.
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `CNN_train.py` | Training script with multi-task regression loss and physical consistency constraints |
-| `AutoKrigingNN.py` | Inference script (CLI + GUI): loads trained model and predicts Kriging parameters from drillhole Excel data |
-| `random_field_generator.py` | Generates anisotropic 3D random fields via GSTools for synthetic training data |
+| `AutoKrigingNN.py` | The 3D CNN model, the directional-range (Fibonacci sphere) sampler, and the positive-definite tensor fitting that recovers the axis lengths and orientations |
+| `CNN_train.py` | Training script: builds the z-score-normalized dataset and trains the model with a mean-squared-error loss over the 64 directional ranges |
+| `random_field_generator.py` | Generates anisotropic 3D random fields via GSTools (scale-down field geometry, simulated drillholes, IDW voxelization, 64-direction range labels) for synthetic training data |
 
 ## Installation
 
 ```bash
-pip install torch numpy pandas scipy gstools tqdm tensorboard
+pip install torch numpy pandas scipy gstools
 ```
 
 ## Usage
@@ -27,66 +25,50 @@ pip install torch numpy pandas scipy gstools tqdm tensorboard
 ### 1. Generate synthetic training data
 
 ```bash
-python random_field_generator.py
+python random_field_generator.py --out_dir synthetic_data --n_samples 3000
 ```
 
-Outputs to `synthetic_data/`, with each sample in a subdirectory containing:
-- `voxel_value.npy` — the full 3D random field
-- `drillholes.csv` — sampled drillhole coordinates and values
-- `parameters.json` — ground-truth variogram and ellipsoid parameters
+The synthetic fields follow the deposit geometry scaled down by a factor of three (450 × 450 × 282 m), with a major range of 50–100 m, near-isotropic axis ratios (minor/major 0.6–1.0, vertical/major 0.4–1.0), and a full dip range of ±90°. Each sample is saved in a subdirectory containing:
+
+- `idw_grid.npy` — the IDW-reconstructed 32×32×32 grade grid
+- `mask_grid.npy` — the validity mask
+- `ranges.npy` — the 64 directional range labels
+- `drillholes.csv` — the simulated drillhole samples
+- `parameters.json` — the ground-truth parameters
 
 ### 2. Train the model
 
 ```bash
-python CNN_train.py
+python CNN_train.py --data_dir synthetic_data --save_dir trained_models --epochs 300
 ```
 
-Checkpoints and logs are saved to `trained_models/` and `training_logs/`.
+The model is trained for 300 epochs with the AdamW optimizer and a cosine annealing schedule. The best checkpoint (`best_model.pth`) and the training history are saved to the output directory.
 
 ### 3. Run inference
 
-**Command line (batch):**
-```bash
-# Single orebody
-python AutoKrigingNN.py --model best_model.pth --data drillholes.xlsx --out results/
+```python
+import torch
+from AutoKrigingNN import AutoKrigingNN, N_DIR, DEVICE, fibonacci_sphere, fit_tensor_psd, tensor_to_axes_angles
 
-# Batch processing
-python AutoKrigingNN.py --model best_model.pth --data-dir data/ --out results/
+model = AutoKrigingNN(out_dim=N_DIR).to(DEVICE)
+model.load_state_dict(torch.load('best_model.pth', weights_only=True))
+model.eval()
+
+# x: [1, 2, 32, 32, 32] tensor (idw_grid + mask_grid, z-score normalized)
+ranges = model(x)                       # 64 directional ranges
+axes, eigvecs = tensor_to_axes_angles(fit_tensor_psd(fibonacci_sphere(N_DIR), ranges))
+# axes: [major, semi-major, minor]; eigvecs: principal orientations
 ```
 
-Input Excel format: columns X, Y, Z, Element1, Element2, ... (first three columns = spatial coordinates, remaining columns = element grades).
+## Important notes
 
-**GUI:**
-```bash
-python AutoKrigingNN.py
-```
-
-### Important notes
-
-- The model uses **strict=True** loading — ensure the checkpoint architecture matches exactly (1 input channel, conv/fc_v/fc_e naming).
-- **V3 training data limitations**: The synthetic training data has parameter bounds: sill ∈ [0.001, 1.8], range ∈ [5, 150] m. Predictions outside these ranges will be clipped.
-- The model is trained on single-structure variogram models (spherical, exponential, Gaussian). Nested multi-structure models are not represented in the current training data.
-
-## Trained model
-
-The trained model weights (`best_model_20260331-2.pth`) are available at:
-<https://github.com/NeoBaoBo/autokriging-cnn/releases>
-
-## Documentation
-
-Detailed documentation is available in the [docs/](docs/) directory:
-
-| Document | Description |
-|----------|-------------|
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Architecture design and technical decisions |
-| [API_REFERENCE.md](docs/API_REFERENCE.md) | API documentation for all core modules |
-| [DEVELOPMENT.md](docs/DEVELOPMENT.md) | Development guide, testing, and contributing |
-| [FAQ.md](docs/FAQ.md) | Frequently asked questions and troubleshooting |
-| [CHANGELOG.md](docs/CHANGELOG.md) | Version history and changes |
+- **Scale-down factor.** The training fields are scaled down by a factor of three relative to the deposit. At inference on real data, multiply the predicted range (and the recovered axis lengths) by three to recover field-scale values.
+- **Single-structure model.** The recovered variogram is a single-structure spherical model whose range approximates the expert long-range component. Nested (multi-structure) variograms are not represented in the current training data and are noted as a limitation.
+- **Analytic sill and nugget.** The sill is the sample variance and the nugget is the experimental variogram intercept; they are computed outside the network and are element-dependent.
 
 ## Reference
 
-Wang, Y.P., Zhang, H.T., and Wang, Y.S. Automated End-to-End Prediction of Kriging Parameters Using Three-Dimensional Convolutional Neural Networks. *Computers & Geosciences*, under review.
+Wang, Y.P., Zhang, H.T., and Wang, Y.S. Automated End-to-End Prediction of Kriging Parameters Using Three-Dimensional Convolutional Neural Networks. *Applied Computing and Geosciences*, under review.
 
 ## License
 
