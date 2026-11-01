@@ -3,24 +3,24 @@
 ## General
 
 **Q: What does AutoKriging-CNN predict?**
-A: Nine Kriging parameters: nugget, sill, range (variogram); major axis, semi-major axis, minor axis, azimuth, dip, plunge (search ellipsoid).
+A: The variogram **range along 64 directions** on the unit sphere. The three axis lengths and principal orientations of the search ellipsoid are recovered from these ranges by positive-definite tensor fitting; the sill and nugget are computed analytically (not predicted).
 
 **Q: What input format does it accept?**
-A: Excel files with columns X, Y, Z, Element1, Element2, ... Drillhole coordinates in meters, grades as numeric values.
+A: Drillhole data with 3D coordinates and element grades. At inference the data are voxelized to a 32×32×32 grid via inverse distance weighting and fed to the network as a 2-channel tensor (grade + validity mask).
 
 **Q: What output does it produce?**
-A: An Excel file per element with all 9 predicted parameters, plus a `summary.xlsx` for batch runs.
+A: 64 directional ranges, from which the search-ellipsoid axis lengths (major, semi-major, minor) and principal orientations are recovered. The sill is the sample variance and the nugget is the experimental variogram intercept.
 
 ## Model Architecture
 
-**Q: Why 1 input channel instead of 2?**
-A: The V3 model uses single-channel input (grade values only). Experiments showed the mask channel did not significantly improve performance.
+**Q: Why 2 input channels instead of 1?**
+A: Channel 0 is the z-score-normalized IDW grade grid, channel 1 is the validity mask. The mask tells the network which voxels contain real data and which are void, which stabilizes learning on sparse drillhole data.
 
-**Q: Why Sigmoid output for all parameters?**
-A: Sigmoid-based scale-to-range mapping ensures all outputs fall within geostatistically meaningful bounds: nugget ∈ [0.0001, 0.3], sill ∈ [0.001, 1.8], range ∈ [5, 150], axes ∈ domain-specific ranges, angles ∈ [0, 360] or [-90, 90].
+**Q: Why is the output a single 64-dimensional vector?**
+A: The anisotropy is modeled directly through 64 directional ranges rather than nine independent parameters. A single regression head predicts all directions, and the ellipsoid is recovered by tensor fitting afterward.
 
-**Q: Why are the three axis predictions sorted?**
-A: Sorting ensures major ≥ semi-major ≥ minor without the aggressive chaining of min() operations used in earlier versions, which collapsed all three axes to identical values.
+**Q: Why compute the sill and nugget analytically instead of predicting them?**
+A: The sill is the sample variance and the nugget is the experimental variogram intercept — both are zero-order statistics with direct analytic definitions. Computing them removes the element-scale dependence from the network and lets it concentrate on the second-order spatial structure (the range), which is the quantity that actually requires variogram fitting.
 
 ## Training
 
@@ -31,40 +31,29 @@ A: 3,000 synthetic 3D random fields, split 8:1:1 (train/val/test).
 A: Spherical, exponential, and Gaussian single-structure models.
 
 **Q: What are the training parameter ranges?**
-A: Sill ∈ [0.5, 3.0], range ∈ [50, 300] m, anisotropy ratios ∈ [1.5, 5.0].
+A: Major range ∈ [50, 100] m (scaled-down; 150–300 m at field scale), minor/major ∈ [0.6, 1.0], vertical/major ∈ [0.4, minor/major], sill ∈ [0.3, 1.0], azimuth ∈ [0°, 360°], dip ∈ [−90°, 90°], plunge ∈ [−30°, 30°]. The near-isotropic axis ratios reflect the weak anisotropy of porphyry mineralization.
 
-**Q: Can I train on my own data?**
-A: Yes. Modify `random_field_generator.py` to match your deposit's parameter ranges, or create custom training samples following the same directory structure.
+**Q: What is the scale-down factor?**
+A: The synthetic fields follow the deposit geometry scaled down by a factor of three. At inference on real data, multiply the predicted range and recovered axis lengths by three to recover field-scale values.
 
 ## Inference
 
 **Q: How do I use the trained model?**
-A: `python AutoKrigingNN.py --model best_model.pth --data drillholes.xlsx --out results/`
+A: See the inference example in `README.md`. The workflow is: IDW voxelization → z-score normalization → CNN forward pass → tensor fitting → axis lengths and orientations.
 
-**Q: What if my drillhole data doesn't fill a 32x32x32 grid well?**
-A: The IDW voxelization with k=8 neighbors handles sparse data. Adjust `cell_size` (currently 10m) in the voxelization step if your deposit extent differs significantly.
+**Q: What IDW parameters are used for voxelization?**
+A: k=12 nearest neighbors and power=2.0 (inverse-squared distance weighting).
 
 **Q: How long does inference take?**
-A: Typically 1-2 seconds per orebody on CPU, including voxelization and model forward pass.
+A: Typically seconds per orebody, including voxelization and the model forward pass.
 
 ## Limitations
 
-**Q: Why do sill predictions cluster near 1.8?**
-A: The V3 training data has sill ∈ [0.001, 1.8]. Real deposit sills outside this range will be clipped. This is a known limitation of the V3 training distribution.
-
-**Q: Why does the model output single-structure spherical models?**
-A: The training data only includes single-structure models. Nested structures are not currently supported.
+**Q: Does the model support nested (multi-structure) variograms?**
+A: No. The recovered variogram is a single-structure spherical model whose range approximates the expert long-range component. Nested structures are noted as a limitation.
 
 **Q: Has the model been validated on deposits other than Wushan?**
 A: No. The current validation is limited to the Wushan porphyry Cu-Mo deposit. Generalization to other deposit types requires further investigation.
 
-## Troubleshooting
-
-**Q: Model loading fails with "AssertionError: Model mismatch"?**
-A: This means the checkpoint architecture doesn't match the current code. Use `strict=True` loading and verify the checkpoint was saved from the same model version.
-
-**Q: "Permission denied" when saving results?**
-A: Close the output Excel file if it's open in another program, or change the output directory.
-
-**Q: Memory error during voxelization?**
-A: For large deposits (>50M cells), increase `cell_size` to reduce grid dimensions.
+**Q: Is the sill accurate for every element?**
+A: The sill is the sample variance of the grades, so it is element-specific and correct by construction. Applications requiring the Kriging variance (rather than point estimates) may need additional calibration of the sill and nugget.
